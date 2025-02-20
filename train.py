@@ -1,182 +1,148 @@
-import logging
 import torch
-from unet import UNet
-from utils import FloodDataset
+import torchvision.transforms as transforms
+from dataset import FloodAreaDataset
 from torch.utils.data import random_split, DataLoader
-from evaluate import evaluate
-import wandb
+from res_unet.model import ResNetUNet
 import torch.optim as optim
-import torch.nn as nn
-import torch.nn.functional as F
+import segmentation_models_pytorch as smp
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-from utils import dice_loss, evaluate_model
-from pathlib import Path
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+import matplotlib.pyplot as plt
+import seaborn as sns
 
+def initialize_data(image_dir, mask_dir, batch_size=8, patch_size=(512, 512), seed=43):
+    torch.manual_seed(seed)
 
-img_dir = "./Image"
-mask_dir = "./Mask"
-dir_checkpoint = Path("./checkpoints")
+    image_transform = transforms.Compose([
+    transforms.Resize(size=patch_size, antialias=True),
+    transforms.ToTensor(),
+    transforms.Normalize(mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225])])
 
+    mask_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize(size=patch_size, antialias=False)
+    ])
 
-def train_model(
-        model, 
-        device, 
-        epochs=100, 
-        batch_size=1, 
-        learning_rate=1e-5, 
-        val_percent=0.1,
-        save_checkpoint=True,
-        amp=True,
-        weight_decay=1e-8,
-        momentum=0.999,
-        gradient_clipping=1.0
-):
-    
-    image_height = 160
-    image_width = 240
+    train_augmentations = transforms.Compose([
+        transforms.RandomVerticalFlip(),
+        transforms.RandomHorizontalFlip()
+    ])
 
-    train_transform = A.Compose(
-        [
-            A.Resize(height=image_height, width=image_width),
-            A.Normalize(
-                mean=[0.0, 0.0, 0.0],
-                std=[1.0, 1.0, 1.0],
-                max_pixel_value=255.0,    
-            ),
-            ToTensorV2(),
-        ],
-    )
+    dataset = FloodAreaDataset(image_dir, mask_dir, image_transform=image_transform, mask_transform=mask_transform)
 
-    #1 dataset
-    dataset = FloodDataset(img_dir=img_dir, mask_dir=mask_dir, transform=train_transform)
+    # Define the sizes for each split
+    dataset_size = len(dataset)
+    test_size = int(0.15 * dataset_size)
+    val_size  = int(0.15 * dataset_size)
+    train_size = dataset_size - test_size - val_size
 
-    #2 train/val split
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(
-        dataset, [n_train, n_val], 
-        generator=torch.Generator().manual_seed(0)
-    )
+    # Use random_split to create train, test, and val datasets
+    train_dataset, temp_dataset = random_split(dataset, [train_size, test_size + val_size], generator=torch.Generator().manual_seed(42))
+    test_dataset, val_dataset = random_split(temp_dataset, [test_size, val_size], generator=torch.Generator().manual_seed(42))
 
-    #3 data loader
-    loader_args = dict(batch_size=batch_size, num_workers=2, pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=True, drop_last=True, **loader_args)
+    train_dataset.augmentations = train_augmentations
 
-    #4 initialize logging
-    # experiment = wandb.init(project='U-Net', resume='never', anonymous='allow')
-    # experiment.config.update(
-    #     dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-    #          val_percent=val_percent, save_checkpoint=save_checkpoint, amp=amp)
-    # )
+    # Create DataLoader instances for each set
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    logging.info(f'''Starting training:
-        Epochs:          {epochs}
-        Batch size:      {batch_size}
-        Learning rate:   {learning_rate}
-        Training size:   {n_train}
-        Validation size: {n_val}
-        Checkpoints:     {save_checkpoint}
-        Device:          {device.type}
-        Mixed Precision: {amp}
-    ''')
+    return {
+        "train": train_loader,
+        "test": test_loader,
+        "val": val_loader
+    }
 
-    #5 set up optimizer
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, 
-                              weight_decay=weight_decay, 
-                              momentum=momentum, 
-                              foreach=True
-                )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+def initialize_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    #6 begin training
-    global_step = 0
+    resnet_unet = ResNetUNet(in_channels=3, out_channels=2, resnet_type="resnet34").to(device)
 
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
-            for batch in train_loader:
-                images, true_masks = batch['image'], batch['mask']
+    # Freeze parameters in blocks 1, 2, 3, and 4
+    for block in [resnet_unet.block1, resnet_unet.block2, resnet_unet.block3, resnet_unet.block4]:
+        for param in block.parameters():
+            param.requires_grad_(False)
 
-                assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+    return resnet_unet
 
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
-
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    masks_pred = model(images)
-                    
-                    loss = criterion(masks_pred, true_masks)
-                    loss += dice_loss(
-                        F.softmax(masks_pred, dim=1).float(),
-                        F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                        multiclass=True
-                    )
-
-                optimizer.zero_grad(set_to_none=True)
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
-
-                pbar.update(images.shape[0])
-                global_step += 1
-                epoch_loss += loss.item()
-
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
-
-                # Evaluation round
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
-
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
-
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        
-        if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            state_dict = model.state_dict()
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=20, early_stop_patience=4):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f"Using device {device}")
 
-    model = UNet(n_channels=3, n_classes=2)
-    model = model.to(memory_format=torch.channels_last)
-    model = model.to(device=device)
+    best_val_loss = float('inf')
+    early_stop_counter = 0
 
-    try:
-        train_model(model=model, device=device, val_percent=0.2)
-    except torch.cuda.OutOfMemoryError:
-        logging.error('Detected OutOfMemoryError! '
-                      'Enabling checkpointing to reduce memory usage, but this slows down training. '
-                      'Consider enabling AMP (--amp) for fast and memory efficient training')
-        torch.cuda.empty_cache()
-        model.use_checkpointing()
-        train_model(
-            model=model,
-            device=device,
-            val_percent=0.2
-        )
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        train_loss = 0.0
+
+        for _, (images, masks) in tqdm(enumerate(train_loader), desc='Training', total=len(train_loader), unit='batch'):
+            images, masks = images.to(device), masks.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for images, masks in tqdm(val_loader, desc='Validation', total=len(val_loader), unit='batch'):
+                images, masks = images.to(device), masks.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        # Update learning rate scheduler
+        scheduler.step(avg_val_loss)
+
+        # Print and check for early stopping
+        print(f'Epoch [{epoch}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}')
+
+        if avg_val_loss < best_val_loss:
+            torch.save(model.state_dict(), 'best_model.pth')  # Save the best model
+            best_val_loss = avg_val_loss
+            early_stop_counter = 0
+        else:
+            early_stop_counter += 1
+
+        if early_stop_counter >= early_stop_patience:
+            print(f'Early stopping after {early_stop_patience} epochs without improvement.')
+            break
+
+    return train_losses, val_losses
+
+
+if __name__ == "__main__":
+    data = initialize_data('Image', 'Mask')
+    model = initialize_model()
+
+    NUM_EPOCHS = 100
+    LEARNING_RATE = 0.001
+    LR_FACTOR = 0.5
+    LR_PATIENCE = 2
+    EARLY_STOP_PATIENCE = 4
+    criterion = smp.losses.DiceLoss('multiclass')
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=LR_FACTOR, patience=LR_PATIENCE, verbose=False)
+    train_losses, val_losses = train_model(model, data['train'], data['val'], criterion, optimizer, scheduler, NUM_EPOCHS, EARLY_STOP_PATIENCE)
+
+    plt.figure(figsize=(10, 5))
+    sns.lineplot(train_losses, label='Train Loss', color='blue')
+    sns.lineplot(val_losses, label='Validation Loss', color='red')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.savefig('training_plot.png')
